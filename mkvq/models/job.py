@@ -18,3 +18,8 @@ class Job:
     out_dir: Path | None = None
     log_path: Path | None = None
     cmdline: str | None = None
+
+    # NEW: Structure preservation fields
+    relative_path: Path | None = None      # Relative path from drop root
+    drop_root: Path | None = None          # Original dropped folder path
+    preserve_structure: bool = True        # Whether to maintain nested output structure

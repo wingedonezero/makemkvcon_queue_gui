@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from .utils.settings import load_settings, save_settings
-from .utils.paths import safe_name, find_disc_roots_in_folder, make_source_spec, is_iso
+from .utils.paths import safe_name, find_disc_roots_in_folder, find_disc_roots_with_structure, make_source_spec, is_iso
 from .models.job import Job
 from .workers.info_probe import InfoProbeWorker
 from .workers.ripper import MakeMKVWorker
@@ -152,23 +152,63 @@ class MainWindow(QMainWindow):
 
     def _add_paths(self, paths):
         for p_str in paths:
-            if not (pth := Path(p_str)).exists(): continue
-            discs = find_disc_roots_in_folder(pth)
-            group_name = pth.name if pth.is_dir() and len(discs) > 1 else None
-            for src_path, child_name in discs:
-                self._queue_one(src_path, child_name, group_name)
+            if not (pth := Path(p_str)).exists():
+                continue
+
+            # Use the enhanced structure-aware discovery
+            disc_infos = find_disc_roots_with_structure(pth)
+
+            # Determine if this should be treated as a group
+            group_name = pth.name if pth.is_dir() and len(disc_infos) > 1 else None
+
+            for disc_info in disc_infos:
+                self._queue_one_with_structure(disc_info, group_name)
+
         self._refresh_queue_label()
 
-    def _queue_one(self, src_path: Path, child_name: str, group_name: str | None):
-        job = Job( "iso" if is_iso(src_path) else "folder", str(src_path), make_source_spec(src_path), child_name, group_root=group_name)
+    def _queue_one_with_structure(self, disc_info, group_name: str | None):
+        """Queue a job with structure information from DiscInfo."""
+        job = Job(
+            source_type="iso" if is_iso(disc_info.disc_path) else "folder",
+            source_path=str(disc_info.disc_path),
+            source_spec=make_source_spec(disc_info.disc_path),
+            child_name=disc_info.display_name,
+            group_root=group_name,
+            # NEW: Structure preservation info
+            relative_path=disc_info.relative_path,
+            drop_root=disc_info.drop_root,
+            preserve_structure=True  # Could be made configurable in preferences
+        )
+
         self.jobs.append(job)
         item = QTreeWidgetItem([job.source_path, job.source_type, "", "Queued", ""])
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable); item.setCheckState(0, Qt.CheckState.Checked)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.CheckState.Checked)
         item.setData(0, Qt.UserRole, job)
         self.tree.addTopLevelItem(item)
-        bar = QProgressBar(); bar.setRange(0, 100); bar.setValue(0); bar.setFixedHeight(12); bar.setTextVisible(True)
+
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setFixedHeight(12)
+        bar.setTextVisible(True)
         self.tree.setItemWidget(item, 4, bar)
+
         self.probe_worker.probe(self.tree.indexOfTopLevelItem(item), job)
+
+    def _queue_one(self, src_path: Path, child_name: str, group_name: str | None):
+        """Legacy method - converts to structure-aware version."""
+        from .utils.paths import DiscInfo
+
+        # Create a minimal DiscInfo for backward compatibility
+        disc_info = DiscInfo(
+            disc_path=src_path,
+            display_name=child_name,
+            relative_path=Path("."),
+            drop_root=src_path.parent if src_path.is_file() else src_path
+        )
+
+        self._queue_one_with_structure(disc_info, group_name)
 
     def _on_jobs_reordered(self):
         new_jobs = [self.tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.tree.topLevelItemCount())]
@@ -231,11 +271,24 @@ class MainWindow(QMainWindow):
                 if not (ch.flags() & Qt.ItemIsUserCheckable): continue
                 total_checkable += 1
                 if ch.checkState(0) == Qt.CheckState.Checked and (txt := ch.text(0)).startswith("#"):
-                    try: keep.add(int(txt[1:]))
-                    except Exception: pass
-            if total_checkable == 0: job.selected_titles = set()
-            elif keep and len(keep) == total_checkable: job.selected_titles = None
-            else: job.selected_titles = keep
+                    try:
+                        title_id = int(txt[1:])
+                        keep.add(title_id)
+                        print(f"DEBUG: Added title {title_id} to selection")
+                    except Exception as e:
+                        print(f"DEBUG: Failed to parse title from '{txt}': {e}")
+
+            print(f"DEBUG: Total checkable: {total_checkable}, Keep: {keep}")
+
+            if total_checkable == 0:
+                job.selected_titles = set()
+                print("DEBUG: No checkable titles - set to empty set")
+            elif keep and len(keep) == total_checkable:
+                job.selected_titles = None
+                print("DEBUG: All titles selected - set to None")
+            else:
+                job.selected_titles = keep
+                print(f"DEBUG: Specific titles selected - set to {keep}")
         finally: self._updating_checks = False
 
     def _on_current_item_changed(self, cur: Optional[QTreeWidgetItem], prev: Optional[QTreeWidgetItem]):
@@ -279,10 +332,33 @@ class MainWindow(QMainWindow):
         jobs_to_run = []
         for i in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(i)
-            if item and item.checkState(0) == Qt.CheckState.Checked:
-                job = item.data(0, Qt.UserRole)
-                if isinstance(job, Job):
-                    jobs_to_run.append((i, job))
+            if not item:
+                continue
+
+            job = item.data(0, Qt.UserRole)
+            if not isinstance(job, Job):
+                continue
+
+            # Check if this disc should be processed
+            should_process = False
+
+            # If parent is fully checked, process it
+            if item.checkState(0) == Qt.CheckState.Checked:
+                should_process = True
+            # If parent is partially checked, check if any titles are selected
+            elif item.checkState(0) == Qt.CheckState.PartiallyChecked:
+                # Check if any child titles are selected
+                for child_idx in range(item.childCount()):
+                    child = item.child(child_idx)
+                    if (child.flags() & Qt.ItemIsUserCheckable and
+                        child.checkState(0) == Qt.CheckState.Checked):
+                        should_process = True
+                        break
+
+            if should_process:
+                # Capture the current selected titles to avoid race conditions
+                current_selection = job.selected_titles.copy() if isinstance(job.selected_titles, set) else job.selected_titles
+                jobs_to_run.append((i, job, current_selection))
 
         if not jobs_to_run:
             self.console.append("=== No jobs selected to run ===")

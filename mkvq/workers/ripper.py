@@ -3,7 +3,7 @@ import os, re, shlex, subprocess, select, time, math
 from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
-from ..utils.paths import safe_name, unique_dir
+from ..utils.paths import safe_name, unique_dir, DiscInfo, create_output_structure
 from ..parsers.makemkv_info import parse_label_from_info, parse_info_details, count_titles_from_info
 from ..models.job import Job
 
@@ -50,7 +50,14 @@ class MakeMKVWorker(QObject):
     def set_jobs(self, jobs_to_run): self.jobs_to_run = jobs_to_run
 
     def run(self):
-        for original_row, job in self.jobs_to_run:
+        for job_data in self.jobs_to_run:
+            # Handle both old (row, job) and new (row, job, selection) formats
+            if len(job_data) == 3:
+                original_row, job, captured_selection = job_data
+            else:
+                original_row, job = job_data
+                captured_selection = job.selected_titles
+
             if self._stop:
                 self.status_text.emit(original_row, "Stopped"); self.job_done.emit(original_row, False)
                 break
@@ -69,11 +76,28 @@ class MakeMKVWorker(QObject):
                         if job.titles_total is None: job.titles_total = count_titles_from_info(out)
                     except Exception: pass
 
-                output_root = Path(self.settings["output_root"]); output_root.mkdir(parents=True, exist_ok=True)
-                base = safe_name(job.group_root) if job.group_root else None
-                base_folder = output_root / (base if base else safe_name(job.label_hint or job.child_name))
-                dest_dir = unique_dir(base_folder / safe_name(job.child_name) if job.group_root else base_folder)
-                dest_dir.mkdir(parents=True, exist_ok=False)
+                output_root = Path(self.settings["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+
+                # Enhanced structure-aware output directory creation
+                if hasattr(job, 'relative_path') and job.relative_path and hasattr(job, 'drop_root') and job.drop_root:
+                    # Enhanced structure preservation
+                    disc_info = DiscInfo(
+                        disc_path=Path(job.source_path),
+                        display_name=job.child_name,
+                        relative_path=job.relative_path,
+                        drop_root=job.drop_root
+                    )
+
+                    preserve_structure = getattr(job, 'preserve_structure', True)
+                    dest_dir = create_output_structure(disc_info, output_root, preserve_structure)
+
+                else:
+                    # Fallback to original logic for backward compatibility
+                    base = safe_name(job.group_root) if job.group_root else None
+                    base_folder = output_root / (base if base else safe_name(job.label_hint or job.child_name))
+                    dest_dir = unique_dir(base_folder / safe_name(job.child_name) if job.group_root else base_folder)
+                    dest_dir.mkdir(parents=True, exist_ok=True)
 
                 pretty_log_path = dest_dir / (f"{safe_name(job.child_name)}_makemkv.log" if job.group_root else f"{dest_dir.name}_makemkv.log")
                 raw_tmp_path = dest_dir / ".mkvq_messages.tmp"
@@ -86,8 +110,10 @@ class MakeMKVWorker(QObject):
                 )
 
                 calc_title_ids = []
-                if isinstance(job.selected_titles, set): calc_title_ids = sorted(list(job.selected_titles))
-                elif job.titles_info: calc_title_ids = sorted(list(job.titles_info.keys()))
+                if isinstance(captured_selection, set):
+                    calc_title_ids = sorted(list(captured_selection))
+                elif job.titles_info:
+                    calc_title_ids = sorted(list(job.titles_info.keys()))
                 title_sizes = {tid: _size_to_bytes(job.titles_info.get(tid, {}).get("size")) for tid in calc_title_ids}
                 total_rip_size = sum(title_sizes.values())
                 title_slices, cumulative_frac = {}, 0.0
@@ -96,8 +122,19 @@ class MakeMKVWorker(QObject):
                         size_frac = title_sizes[tid] / total_rip_size
                         title_slices[tid] = {"start": cumulative_frac, "frac": size_frac}; cumulative_frac += size_frac
 
-                if isinstance(job.selected_titles, set) and job.selected_titles: title_args = [str(i) for i in sorted(job.selected_titles)]
-                else: title_args = ["all"]
+                # Handle title selection logic properly using captured selection
+                if isinstance(captured_selection, set):
+                    if captured_selection:
+                        # Non-empty set: specific titles selected
+                        title_args = [str(i) for i in sorted(captured_selection)]
+                    else:
+                        # Empty set: no titles selected, skip this job
+                        self.line_out.emit(original_row, "No titles selected - skipping job")
+                        self.job_done.emit(original_row, True)  # Mark as completed (skipped)
+                        continue
+                else:
+                    # None: all titles selected
+                    title_args = ["all"]
 
                 cmd = [mk, "-r"]
                 if show_p: cmd.append("--progress=-stdout")
