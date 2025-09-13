@@ -89,7 +89,9 @@ class MakeMKVWorker(QObject):
             self.progress.emit(original_row, 0)
 
             try:
+                # Single reprobe at job start (not per title)
                 if self.settings.get("reprobe_before_rip", True):
+                    self.status_text.emit(original_row, "Probing disc…")
                     try:
                         out = subprocess.check_output(
                             [self.settings["makemkvcon_path"], "-r", "info", job.source_spec],
@@ -101,8 +103,9 @@ class MakeMKVWorker(QObject):
                         job.titles_info = job.titles_info or parse_info_details(out)
                         if job.titles_total is None:
                             job.titles_total = count_titles_from_info(out)
-                    except Exception:
-                        pass
+                        self.line_out.emit(original_row, f"Probed disc: {job.titles_total or '?'} titles found")
+                    except Exception as e:
+                        self.line_out.emit(original_row, f"Probe failed: {e}")
 
                 output_root = Path(self.settings["output_root"])
                 output_root.mkdir(parents=True, exist_ok=True)
@@ -141,7 +144,6 @@ class MakeMKVWorker(QObject):
                     if job.group_root
                     else f"{dest_dir.name}_makemkv.log"
                 )
-                raw_tmp_path = dest_dir / ".mkvq_messages.tmp"
                 job.out_dir, job.log_path = dest_dir, pretty_log_path
 
                 mk, show_p, human, keep_raw, debugf = (
@@ -152,21 +154,11 @@ class MakeMKVWorker(QObject):
                     bool(self.settings.get("enable_debugfile", False)),
                 )
 
-                # Simplified, accurate progress tracking
-                calc_title_ids = []
-                if isinstance(captured_selection, set):
-                    calc_title_ids = sorted(list(captured_selection))
-                elif job.titles_info:
-                    calc_title_ids = sorted(list(job.titles_info.keys()))
-
-                total_titles_to_rip = len(calc_title_ids)
-                current_title_idx = 0
-
-                # Handle title selection logic properly using captured selection
+                # Determine which titles to rip
                 if isinstance(captured_selection, set):
                     if captured_selection:
                         # Non-empty set: specific titles selected
-                        title_args = [str(i) for i in sorted(captured_selection)]
+                        titles_to_rip = sorted(list(captured_selection))
                     else:
                         # Empty set: no titles selected, skip this job
                         self.line_out.emit(original_row, "No titles selected - skipping job")
@@ -174,195 +166,209 @@ class MakeMKVWorker(QObject):
                         continue
                 else:
                     # None: all titles selected
-                    title_args = ["all"]
-
-                cmd = [mk, "-r"]
-                if show_p:
-                    cmd.append("--progress=-stdout")
-                cmd.extend(["--messages", str(raw_tmp_path)])
-                if debugf:
-                    cmd.extend(["--debug", str(dest_dir / (dest_dir.name + "_debug.log"))])
-                if prof := self.settings.get("profile_path", "").strip():
-                    cmd.extend(["--profile", prof])
-                if extra := self.settings.get("extra_args", "").strip():
-                    cmd.extend(shlex.split(extra))
-
-                mkv_command_parts = [
-                    "mkv",
-                    job.source_spec,
-                    *title_args,
-                    str(dest_dir),
-                    f"--minlength={int(self.settings['minlength'])}",
-                ]
-                cmd.extend(mkv_command_parts)
-
-                job.cmdline = " ".join(shlex.quote(c) for c in cmd)
-                self.line_out.emit(original_row, "$ " + job.cmdline)
-
-                # Simple progress tracking variables
-                current_title_idx = 0
-                last_prgv_x, last_prgv_z = 0, 65536
-
-                # Simple ETA calculation
-                progress_history = []
-                last_progress_time = time.time()
-
-                ok = False
-                raw_tmp_path.touch(exist_ok=True)
-                with (
-                    open(pretty_log_path, "w", encoding="utf-8") as lf,
-                    subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True,
-                    ) as proc,
-                    open(raw_tmp_path, "r", encoding="utf-8", errors="replace") as tail,
-                ):
-
-                    tail.seek(0, os.SEEK_END)
-                    last_tail_pos = tail.tell()
-
-                    def tail_messages():
-                        nonlocal last_tail_pos
-                        tail.seek(last_tail_pos)
-                        if not (chunk := tail.read()):
-                            return
-                        last_tail_pos = tail.tell()
-                        for raw in chunk.splitlines():
-                            if not raw or raw.startswith("PRG"):
-                                continue
-                            if out := (_msg_to_human(raw) if human else raw):
-                                self.line_out.emit(original_row, out)
-                                try:
-                                    lf.write(out + "\n")
-                                    lf.flush()
-                                except Exception:
-                                    pass
-
-                    if total_titles_to_rip > 0:
-                        self.status_text.emit(
-                            original_row, f"Starting • {total_titles_to_rip} titles selected"
-                        )
+                    if job.titles_info:
+                        titles_to_rip = sorted(list(job.titles_info.keys()))
                     else:
-                        self.status_text.emit(original_row, "Starting…")
+                        # Fallback: try to rip everything
+                        self.line_out.emit(original_row, "All titles selected but no title info - using 'all'")
+                        titles_to_rip = ["all"]
 
-                    while True:
-                        if self._stop:
-                            proc.terminate()
-                            break
-                        tail_messages()
-                        rl, _, _ = select.select([proc.stdout], [], [], 0.1)
-                        if rl:
-                            if line := proc.stdout.readline():
-                                if keep_raw:
+                total_titles_to_rip = len(titles_to_rip)
+                overall_success = True
+
+                self.line_out.emit(original_row, f"Processing {total_titles_to_rip} title(s)")
+
+                # Process each title individually
+                for title_idx, title_id in enumerate(titles_to_rip):
+                    if self._stop:
+                        self.status_text.emit(original_row, "Stopped")
+                        overall_success = False
+                        break
+
+                    current_title_num = title_idx + 1
+
+                    # Create unique message file for each title
+                    raw_tmp_path = dest_dir / f".mkvq_messages_title_{title_id}.tmp"
+
+                    # Build command for this specific title
+                    cmd = [mk, "-r"]
+                    if show_p:
+                        cmd.append("--progress=-stdout")
+                    cmd.extend(["--messages", str(raw_tmp_path)])
+                    if debugf:
+                        cmd.extend(["--debug", str(dest_dir / f"{dest_dir.name}_title_{title_id}_debug.log")])
+                    if prof := self.settings.get("profile_path", "").strip():
+                        cmd.extend(["--profile", prof])
+                    if extra := self.settings.get("extra_args", "").strip():
+                        cmd.extend(shlex.split(extra))
+
+                    # Single title command: makemkvcon mkv source title_id dest_dir
+                    mkv_command_parts = [
+                        "mkv",
+                        job.source_spec,
+                        str(title_id),  # Single title only
+                        str(dest_dir),
+                        f"--minlength={int(self.settings['minlength'])}",
+                    ]
+                    cmd.extend(mkv_command_parts)
+
+                    title_cmdline = " ".join(shlex.quote(c) for c in cmd)
+                    self.line_out.emit(original_row, f"Title {current_title_num}/{total_titles_to_rip}: $ {title_cmdline}")
+
+                    # Progress tracking for this title
+                    title_success = False
+                    last_prgv_x, last_prgv_z = 0, 65536
+                    progress_history = []
+                    last_progress_time = time.time()
+
+                    raw_tmp_path.touch(exist_ok=True)
+                    with (
+                        open(pretty_log_path, "a", encoding="utf-8") as lf,  # Append mode for multiple titles
+                        subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            universal_newlines=True,
+                        ) as proc,
+                        open(raw_tmp_path, "r", encoding="utf-8", errors="replace") as tail,
+                    ):
+
+                        lf.write(f"\n=== Title {title_id} ({current_title_num}/{total_titles_to_rip}) ===\n")
+                        lf.flush()
+
+                        tail.seek(0, os.SEEK_END)
+                        last_tail_pos = tail.tell()
+
+                        def tail_messages():
+                            nonlocal last_tail_pos
+                            tail.seek(last_tail_pos)
+                            if not (chunk := tail.read()):
+                                return
+                            last_tail_pos = tail.tell()
+                            for raw in chunk.splitlines():
+                                if not raw or raw.startswith("PRG"):
+                                    continue
+                                if out := (_msg_to_human(raw) if human else raw):
+                                    self.line_out.emit(original_row, f"Title {title_id}: {out}")
                                     try:
-                                        lf.write(line)
+                                        lf.write(f"Title {title_id}: {out}\n")
                                         lf.flush()
                                     except Exception:
                                         pass
-                                line = line.strip()
 
-                                # Simple progress parsing - just track what MakeMKV reports
-                                if mc := re.match(r"^PRGC:(\d+),", line):
-                                    prgc_code = int(mc.group(1))
-                                    if prgc_code == 5017:  # Title completed
-                                        current_title_idx = min(current_title_idx + 1, total_titles_to_rip)
-                                elif mv := re.match(r"^PRGV:(\d+),(\d+),(\d+)\s*$", line):
-                                    x, z = int(mv.group(1)), int(mv.group(3)) or 65536
-                                    last_prgv_x, last_prgv_z = x, z
+                        self.status_text.emit(
+                            original_row,
+                            f"Title {current_title_num}/{total_titles_to_rip} (#{title_id})"
+                        )
 
-                                    # Calculate per-operation percentage for status text
-                                    operation_pct = int((100 * x) / z) if z > 0 else 0
-                                    if proc.poll() is None and operation_pct >= 100:
-                                        operation_pct = 99  # Never show 100% until actually done
+                        while True:
+                            if self._stop:
+                                proc.terminate()
+                                break
+                            tail_messages()
+                            rl, _, _ = select.select([proc.stdout], [], [], 0.1)
+                            if rl:
+                                if line := proc.stdout.readline():
+                                    if keep_raw:
+                                        try:
+                                            lf.write(f"RAW: {line}")
+                                            lf.flush()
+                                        except Exception:
+                                            pass
+                                    line = line.strip()
 
-                                    # Calculate overall job progress for the main progress bar
-                                    if total_titles_to_rip > 0:
-                                        # Each title is worth (100 / total_titles) percent of the job
+                                    # Progress parsing for individual title
+                                    if mv := re.match(r"^PRGV:(\d+),(\d+),(\d+)\s*$", line):
+                                        x, z = int(mv.group(1)), int(mv.group(3)) or 65536
+                                        last_prgv_x, last_prgv_z = x, z
+
+                                        # Calculate per-title percentage
+                                        title_pct = int((100 * x) / z) if z > 0 else 0
+                                        if proc.poll() is None and title_pct >= 100:
+                                            title_pct = 99  # Never show 100% until actually done
+
+                                        # Calculate overall job progress across all titles
                                         title_weight = 100.0 / total_titles_to_rip
-                                        completed_titles = max(0, current_title_idx - 1)  # Already finished
-                                        current_title_progress = (operation_pct / 100.0) * title_weight
-                                        overall_job_pct = int(
-                                            completed_titles * title_weight + current_title_progress
-                                        )
-                                    else:
-                                        overall_job_pct = operation_pct
+                                        completed_titles_progress = title_idx * title_weight
+                                        current_title_progress = (title_pct / 100.0) * title_weight
+                                        overall_job_pct = int(completed_titles_progress + current_title_progress)
 
-                                    # Send overall job progress to the main progress bar
-                                    self.progress.emit(original_row, max(0, min(100, overall_job_pct)))
+                                        # Send overall progress to UI
+                                        self.progress.emit(original_row, max(0, min(100, overall_job_pct)))
 
-                                    # Simple ETA calculation based on current operation
-                                    now = time.time()
-                                    eta_text = "--:--:--"
+                                        # ETA calculation
+                                        now = time.time()
+                                        eta_text = "--:--:--"
 
-                                    # Track progress over time for ETA
-                                    if now - last_progress_time >= 3.0:  # Update every 3 seconds
-                                        progress_history.append((now, x))
-                                        # Keep only last 5 data points (15 seconds of history)
-                                        if len(progress_history) > 5:
-                                            progress_history.pop(0)
-                                        last_progress_time = now
+                                        if now - last_progress_time >= 3.0:
+                                            progress_history.append((now, x))
+                                            if len(progress_history) > 5:
+                                                progress_history.pop(0)
+                                            last_progress_time = now
 
-                                    if len(progress_history) >= 2 and z > x:
-                                        # Simple rate calculation
-                                        time_span = progress_history[-1][0] - progress_history[0][0]
-                                        progress_span = progress_history[-1][1] - progress_history[0][1]
+                                        if len(progress_history) >= 2 and z > x:
+                                            time_span = progress_history[-1][0] - progress_history[0][0]
+                                            progress_span = progress_history[-1][1] - progress_history[0][1]
 
-                                        if time_span > 0 and progress_span > 0:
-                                            rate = progress_span / time_span  # progress units per second
-                                            remaining = z - x
-                                            eta_seconds = int(remaining / rate)
+                                            if time_span > 0 and progress_span > 0:
+                                                rate = progress_span / time_span
+                                                remaining = z - x
+                                                eta_seconds = int(remaining / rate)
 
-                                            if eta_seconds < 3600 * 24:  # Less than 24 hours
-                                                h, remainder = divmod(eta_seconds, 3600)
-                                                m, s = divmod(remainder, 60)
-                                                eta_text = f"{h:02d}:{m:02d}:{s:02d}"
+                                                if eta_seconds < 3600 * 24:
+                                                    h, remainder = divmod(eta_seconds, 3600)
+                                                    m, s = divmod(remainder, 60)
+                                                    eta_text = f"{h:02d}:{m:02d}:{s:02d}"
 
-                                    # Status text shows per-title progress and ETA
-                                    if total_titles_to_rip > 1 and current_title_idx > 0:
+                                        # Status shows current title progress and ETA
                                         self.status_text.emit(
                                             original_row,
-                                            f"Title {current_title_idx}/{total_titles_to_rip} • {operation_pct}% • ETA {eta_text}",
-                                        )
-                                    else:
-                                        self.status_text.emit(
-                                            original_row, f"Working • {operation_pct}% • ETA {eta_text}"
+                                            f"Title {current_title_num}/{total_titles_to_rip} (#{title_id}) • {title_pct}% • ETA {eta_text}",
                                         )
 
-                                elif line:
-                                    self.line_out.emit(original_row, line)
-                        if proc.poll() is not None:
-                            tail_messages()
-                            break
+                                    elif line:
+                                        self.line_out.emit(original_row, f"Title {title_id}: {line}")
+                            if proc.poll() is not None:
+                                tail_messages()
+                                break
 
-                    ok = proc.wait() == 0
+                        title_success = proc.wait() == 0
+
+                        if title_success:
+                            self.line_out.emit(original_row, f"Title {title_id}: Completed successfully")
+                        else:
+                            self.line_out.emit(original_row, f"Title {title_id}: Failed")
+                            overall_success = False
+
+                    # Cleanup title-specific message file
+                    try:
+                        if raw_tmp_path.exists():
+                            if self.settings.get("keep_structured_messages", False):
+                                keep = dest_dir / f"{pretty_log_path.stem}_title_{title_id}.raw.txt"
+                                if keep.exists():
+                                    keep.unlink()
+                                raw_tmp_path.rename(keep)
+                            else:
+                                raw_tmp_path.unlink()
+                    except Exception:
+                        pass
+
+                # Store the overall command for reference (first title's command as example)
+                if titles_to_rip:
+                    example_cmd = [mk, "-r"] + (["--progress=-stdout"] if show_p else [])
+                    example_cmd.extend(["mkv", job.source_spec, str(titles_to_rip[0]), str(dest_dir)])
+                    job.cmdline = " ".join(shlex.quote(c) for c in example_cmd) + f" # (and {len(titles_to_rip)-1} more titles)" if len(titles_to_rip) > 1 else ""
+
             except FileNotFoundError:
                 self.line_out.emit(original_row, "ERROR: makemkvcon not found. Check Preferences.")
-                ok = False
+                overall_success = False
             except Exception as e:
                 self.line_out.emit(original_row, f"ERROR: {e}")
-                ok = False
-            finally:
-                try:
-                    if raw_tmp_path.exists():
-                        if self.settings.get("keep_structured_messages", False):
-                            keep = dest_dir / (pretty_log_path.stem + ".raw.txt")
-                            if keep.exists():
-                                keep.unlink()
-                            raw_tmp_path.rename(keep)
-                        else:
-                            raw_tmp_path.unlink()
-                except Exception:
-                    pass
+                overall_success = False
 
-            final_pct = (
-                100
-                if ok
-                else (int((100 * last_prgv_x) / max(1, last_prgv_z)) if last_prgv_z > 0 else 0)
-            )
-            self.progress.emit(original_row, final_pct)
-            self.status_text.emit(original_row, "Done" if ok else "Failed")
-            self.job_done.emit(original_row, ok)
+            # Final status update
+            self.progress.emit(original_row, 100 if overall_success else 0)
+            self.status_text.emit(original_row, "Done" if overall_success else "Failed")
+            self.job_done.emit(original_row, overall_success)

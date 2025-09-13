@@ -33,8 +33,18 @@ class MainWindow(QMainWindow):
         self.queue_label.setStyleSheet("font-weight:600;")
 
         self.tree = DropTree()
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(["Source", "Type", "Titles", "Status", "Progress"])
+        # 8-column layout for enhanced title information
+        self.tree.setColumnCount(8)
+        self.tree.setHeaderLabels([
+            "Source/Title",      # 0: Source path (parent) / Title # (child)
+            "Video Codec",       # 1: Empty (parent) / Video codec (child)
+            "Audio",       # 2: Empty (parent) / Audio codec (child)
+            "Subtitles",         # 3: Empty (parent) / Subtitle count (child)
+            "Chapters",          # 4: Empty (parent) / Chapter count (child)
+            "Duration",          # 5: Empty (parent) / Duration (child)
+            "Status",            # 6: Status (parent) / Empty (child)
+            "Progress"           # 7: Progress bar (parent) / Empty (child)
+        ])
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._row_menu)
         self.tree.itemChanged.connect(self._on_item_checked)
@@ -44,11 +54,14 @@ class MainWindow(QMainWindow):
 
         hdr = self.tree.header()
         hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)         # Source/Title - stretches
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents) # Video Codec
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents) # Audio
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents) # Subtitles
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeToContents) # Chapters
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeToContents) # Duration
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeToContents) # Status
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeToContents) # Progress
 
         self.details = DetailsPanel()
 
@@ -181,7 +194,8 @@ class MainWindow(QMainWindow):
         )
 
         self.jobs.append(job)
-        item = QTreeWidgetItem([job.source_path, job.source_type, "", "Queued", ""])
+        # Parent items show: source path, empty, empty, empty, empty, empty, status, progress
+        item = QTreeWidgetItem([job.source_path, "", "", "", "", "", "Queued", ""])
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(0, Qt.CheckState.Checked)
         item.setData(0, Qt.UserRole, job)
@@ -192,7 +206,7 @@ class MainWindow(QMainWindow):
         bar.setValue(0)
         bar.setFixedHeight(12)
         bar.setTextVisible(True)
-        self.tree.setItemWidget(item, 4, bar)
+        self.tree.setItemWidget(item, 7, bar)  # Progress bar in column 7
 
         self.probe_worker.probe(self.tree.indexOfTopLevelItem(item), job)
 
@@ -216,13 +230,25 @@ class MainWindow(QMainWindow):
         self.console.append("Queue order changed.")
         self._refresh_queue_label()
 
+    def _get_dominant_codec(self, streams: list, stream_type: str) -> str:
+        """Get the most common codec of a given type from streams."""
+        codecs = [s.get('codec', '') for s in streams if s.get('kind') == stream_type and s.get('codec')]
+        if not codecs:
+            return ""
+        # Return the most common codec, or first if tie
+        from collections import Counter
+        most_common = Counter(codecs).most_common(1)
+        return most_common[0][0] if most_common else ""
+
     def _on_probed(self, row: int, label: str | None, titles_total: int | None, titles_info: dict | None, err: str):
         if not (0 <= row < len(self.jobs)): return
         job, item = self.jobs[row], self.tree.topLevelItem(row)
         if not item: return
 
         if label: job.label_hint = label
-        if titles_total is not None: item.setText(2, str(titles_total))
+        if titles_total is not None:
+            # Don't set column text for parent - we'll show title count via children
+            pass
         job.titles_total = titles_total
 
         if titles_info:
@@ -231,19 +257,60 @@ class MainWindow(QMainWindow):
             try:
                 item.takeChildren()
                 minlen, any_child = int(self.settings.get("minlength", 0)), False
+
                 for t_idx in sorted(titles_info):
                     info = titles_info[t_idx]
-                    if (secs := duration_to_seconds(info.get("duration"))) and secs < minlen: continue
-                    child = QTreeWidgetItem([f"#{t_idx}", "", "", "", ""]); child.setFlags(child.flags() | Qt.ItemIsUserCheckable); child.setCheckState(0, Qt.CheckState.Checked); item.addChild(child)
+                    if (secs := duration_to_seconds(info.get("duration"))) and secs < minlen:
+                        continue
+
+                    # Extract title information for display
+                    streams = info.get("streams", [])
+                    video_codec = self._get_dominant_codec(streams, "Video")
+
+                    # Count audio tracks
+                    audio_count = len([s for s in streams if s.get('kind') == 'Audio'])
+                    audio_text = str(audio_count) if audio_count > 0 else ""
+
+                    # Count subtitles
+                    subtitle_count = len([s for s in streams if s.get('kind') == 'Subtitles'])
+                    subtitle_text = str(subtitle_count) if subtitle_count > 0 else ""
+
+                    # Get chapters and duration
+                    chapters = info.get("chapters", 0)
+                    chapter_text = str(chapters) if chapters > 0 else ""
+                    duration = info.get("duration", "")
+
+                    # Child items show: title #, video codec, audio count, subtitle count, chapters, duration, empty, empty
+                    child = QTreeWidgetItem([
+                        f"#{t_idx}",      # Title number
+                        video_codec,     # Video codec
+                        audio_text,      # Audio track count
+                        subtitle_text,   # Subtitle count
+                        chapter_text,    # Chapter count
+                        duration,        # Duration
+                        "",              # Status (empty for children)
+                        ""               # Progress (empty for children)
+                    ])
+                    child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                    child.setCheckState(0, Qt.CheckState.Checked)
+                    item.addChild(child)
                     any_child = True
+
                 if not any_child:
-                    c = QTreeWidgetItem(["(no titles ≥ minlength)"]); c.setDisabled(True); item.addChild(c)
+                    c = QTreeWidgetItem(["(no titles ≥ minlength)", "", "", "", "", "", "", ""])
+                    c.setDisabled(True)
+                    item.addChild(c)
                     job.selected_titles = set()
-                else: item.setCheckState(0, Qt.CheckState.Checked); job.selected_titles = None
+                else:
+                    item.setCheckState(0, Qt.CheckState.Checked)
+                    job.selected_titles = None
+
                 if (cur := self.tree.currentItem()) and (cur is item or cur.parent() is item):
                     self._show_details_for_selection(cur)
-            finally: self._updating_checks = False
-        item.setText(3, "Ready" if not err else f"Probe error: {err}")
+            finally:
+                self._updating_checks = False
+
+        item.setText(6, "Ready" if not err else f"Probe error: {err}")  # Status in column 6
 
     def _set_children_check(self, parent_item: QTreeWidgetItem, state: Qt.CheckState):
         for i in range(parent_item.childCount()):
@@ -393,11 +460,11 @@ class MainWindow(QMainWindow):
     def on_progress(self, row: int, pct: int):
         if 0 <= row < self.tree.topLevelItemCount():
             if item := self.tree.topLevelItem(row):
-                if bar := self.tree.itemWidget(item, 4): bar.setValue(max(0, min(100, pct)))
+                if bar := self.tree.itemWidget(item, 7): bar.setValue(max(0, min(100, pct)))  # Progress bar in column 7
 
     def on_status_text(self, row: int, text: str):
         if 0 <= row < len(self.jobs):
-            if item := self.tree.topLevelItem(row): item.setText(3, text)
+            if item := self.tree.topLevelItem(row): item.setText(6, text)  # Status in column 6
             self.current_job_row = row
             self._refresh_queue_label(len(self.worker.jobs_to_run))
 
@@ -406,8 +473,8 @@ class MainWindow(QMainWindow):
 
     def on_done(self, row: int, ok: bool):
         if item := self.tree.topLevelItem(row):
-            item.setText(3, "Done" if ok else "Failed")
-            if bar := self.tree.itemWidget(item, 4): bar.setValue(100 if ok else bar.value())
+            item.setText(6, "Done" if ok else "Failed")  # Status in column 6
+            if bar := self.tree.itemWidget(item, 7): bar.setValue(100 if ok else bar.value())  # Progress bar in column 7
 
         self.completed_jobs[row] = ok
         jobs_running_count = len(self.worker.jobs_to_run)
