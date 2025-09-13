@@ -1,0 +1,71 @@
+angles
+3d support
+
+Smart Title Analysis Features
+Duplicate Title Detection:
+
+Use the original_title_id and segments_count data you're already parsing to identify duplicate playlists
+Add a "Smart Selection" mode that auto-selects the best version when duplicates are found
+Show warnings like "Title #3 appears to be duplicate of #1 (same duration, different playlist)"
+
+Main Feature Detection:
+
+Implement heuristics based on duration patterns - main features are typically much longer than extras
+Use chapter count as an indicator (main features usually have 8-20+ chapters)
+Add a preference for "Main Feature Only" mode for movies
+
+User Experience Improvements
+Batch Operations:
+
+Multi-select in the queue tree to apply settings to multiple discs at once
+"Select All Main Features" button that uses smart detection
+Bulk output folder assignment
+
+Better Progress Information:
+
+Show estimated time remaining for entire queue (not just current job)
+Display ripping speed (MB/s) in status
+Add estimated completion time for queue
+
+Enhanced Logging:
+
+Option to save a summary report after queue completion
+Track which titles were actually ripped vs skipped
+Show space saved by skipping duplicates/unwanted titles
+
+Advanced MakeMKV Integration
+Profile Management:
+
+Built-in profile editor for common use cases (different quality settings)
+Quick profile switching per job or title
+Preset profiles for "Archival Quality", "Streaming Optimized", etc.
+
+Error Recovery:
+
+Retry failed jobs with different settings automatically
+Skip bad sectors option with user confirmation
+Resume interrupted rips if MakeMKV supports it
+
+Metadata Enhancements
+Title Intelligence:
+
+Parse more stream flags from the apdefs.h definitions you have
+Better detection of commentary tracks, alternate angles, forced subtitles
+Show which audio tracks are lossless vs lossy
+
+Disc Information:
+
+Parse and display disc protection info (AACS, BD+, etc.)
+Show disc region information if available
+Display total disc capacity and free space calculations
+
+Most Practical Next Steps
+If I had to prioritize, I'd suggest:
+
+Duplicate title detection - This solves a real problem with many commercial discs
+Smart main feature selection - Saves time for movie collections
+Better queue progress estimates - Makes long operations more user-friendly
+Batch selection operations - Improves workflow for large collections
+
+The duplicate detection would be particularly valuable since many Blu-rays have 3-4 copies of the main feature in different playlists, and your parser already extracts the data needed to identify them.
+Which of these areas interests you most, or do you have a specific workflow pain point you'd like to address?

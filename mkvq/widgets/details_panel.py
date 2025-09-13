@@ -27,11 +27,11 @@ class DetailsPanel(QTreeWidget):
         title_node = QTreeWidgetItem(["Title", f"#{t_idx}"])
         self.addTopLevelItem(title_node)
 
-        # Basic title metadata
+        # Basic title metadata with correct labeling
         if info.get("duration"):
             QTreeWidgetItem(title_node, ["Duration", info["duration"]])
         if info.get("size"):
-            QTreeWidgetItem(title_node, ["Size", info["size"]])
+            QTreeWidgetItem(title_node, ["File Size", info["size"]])
         if info.get("chapters") is not None:
             chapters_count = info["chapters"]
             QTreeWidgetItem(title_node, ["Chapters", str(chapters_count)])

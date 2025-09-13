@@ -259,6 +259,11 @@ class MainWindow(QMainWindow):
 
     def _on_item_checked(self, changed_item: QTreeWidgetItem, column: int):
         if self._updating_checks: return
+
+        # Don't process checkbox changes during queue execution
+        if self.running:
+            return
+
         self._updating_checks = True
         try:
             top_item = changed_item if not (parent := changed_item.parent()) else parent
@@ -274,21 +279,15 @@ class MainWindow(QMainWindow):
                     try:
                         title_id = int(txt[1:])
                         keep.add(title_id)
-                        print(f"DEBUG: Added title {title_id} to selection")
-                    except Exception as e:
-                        print(f"DEBUG: Failed to parse title from '{txt}': {e}")
-
-            print(f"DEBUG: Total checkable: {total_checkable}, Keep: {keep}")
+                    except Exception:
+                        pass
 
             if total_checkable == 0:
                 job.selected_titles = set()
-                print("DEBUG: No checkable titles - set to empty set")
             elif keep and len(keep) == total_checkable:
                 job.selected_titles = None
-                print("DEBUG: All titles selected - set to None")
             else:
                 job.selected_titles = keep
-                print(f"DEBUG: Specific titles selected - set to {keep}")
         finally: self._updating_checks = False
 
     def _on_current_item_changed(self, cur: Optional[QTreeWidgetItem], prev: Optional[QTreeWidgetItem]):
@@ -421,6 +420,9 @@ class MainWindow(QMainWindow):
             self.running, self.current_job_row = False, None
             self.work_thread.quit()
             self._refresh_queue_label()
+
+            # Don't re-probe or reset selections after queue finishes
+            # User selections should be preserved
 
     def open_prefs(self):
         dlg = PrefsDialog(self.settings, self)

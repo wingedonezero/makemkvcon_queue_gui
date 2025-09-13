@@ -141,21 +141,22 @@ def parse_info_details(output: str) -> dict:
         title_info = info[t_idx]
 
         # Enhanced chapter parsing - extract actual chapter count
-        chapters_str = codes.get(9, '0')
-        if chapters_str:
-            # Try to extract number from various chapter formats
-            chapter_match = re.search(r'(\d+)', chapters_str)
+        chapters_str = codes.get(8, '0')  # Code 8 = ap_iaChapterCount
+        if chapters_str and chapters_str.isdigit():
+            title_info["chapters"] = int(chapters_str)
+        else:
+            # Fallback: try to extract number from chapter string format
+            chapter_match = re.search(r'(\d+)', str(chapters_str))
             if chapter_match:
                 title_info["chapters"] = int(chapter_match.group(1))
             else:
                 title_info["chapters"] = 0
-        else:
-            title_info["chapters"] = 0
 
-        # Basic title metadata
-        title_info["source"] = codes.get(16, "")
-        title_info["duration"] = codes.get(10, "")
-        title_info["size"] = codes.get(11, "")
+        # Basic title metadata - corrected codes based on apdefs.h
+        title_info["duration"] = codes.get(9, "")   # Code 9 = ap_iaDuration (time)
+        title_info["size"] = codes.get(10, "")      # Code 10 = ap_iaDiskSize (GB size)
+        title_info["size_bytes"] = codes.get(11, "")  # Code 11 = ap_iaDiskSizeBytes
+        title_info["source"] = codes.get(16, "")    # Source file
 
         # Additional title metadata from MakeMKV
         title_info["name"] = codes.get(2, "")  # Title name
